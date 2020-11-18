@@ -1,0 +1,673 @@
+package com.biostime.app.orderCenter.service.impl;
+
+import com.biostime.app.eborder.entity.EbOrderDetailInfo;
+import com.biostime.app.eborder.entity.EbProductRelated;
+import com.biostime.app.eborder.entity.EbRefundInfo;
+import com.biostime.app.eborder.repository.EbOrderRepository;
+import com.biostime.app.eborder.repository.OmsDeliverRepository;
+import com.biostime.app.eborder.repository.OmsReturnorderRepository;
+import com.biostime.app.eborder.repository.PackProductMapRepository;
+import com.biostime.app.eborder.service.OmsService;
+import com.biostime.app.eborder.util.EbOrderLogUtil;
+import com.biostime.app.orderCenter.service.OmsCenterService;
+import com.biostime.app.orderCenter.service.OmsOrderService;
+import com.biostime.app.settings.repository.ProductRepository;
+import com.biostime.common.pager.Page;
+import com.biostime.constants.CacheConstant;
+import com.biostime.constants.SysConfig;
+import com.biostime.exception.base.RepositoryException;
+import com.biostime.exception.base.ServiceException;
+import com.biostime.util.DateUtil;
+import com.biostime.util.FileLogsUtil;
+import com.biostime.util.ParamUtil;
+import com.biostime.utils.weixin.OmsUtil;
+import com.biostime.webservice.tmall.bean.*;
+import it.logutil.intf.LogUtil;
+import net.sf.json.JSONObject;
+import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+/**
+ * @author W1076
+ */
+@Service
+public class OmsCenterServiceImpl implements OmsCenterService {
+
+    private static Logger log = LogUtil.getLogger(OmsCenterServiceImpl.class);
+
+    @Autowired
+    OmsDeliverRepository omsDeliverRepository;
+
+    @Autowired
+    OmsReturnorderRepository omsReturnorderRepository;
+
+    @Autowired
+    EbOrderRepository ebOrderRepository;
+
+    @Autowired
+    OmsOrderService omsOrderService;
+
+    @Autowired
+    ProductRepository productRepository;
+
+    @Autowired
+    EbOrderLogUtil util;
+
+    @Autowired
+    OmsService omsService;
+
+    @Autowired
+    PackProductMapRepository packProductMapRepository;
+
+
+    @Override
+    public void distributeOmsOrder(String date, Long pageNum, Map<String, String> map, List<String> list, List<String> shopExclusionList) {
+        int timeSize = ParamUtil.toInt(SysConfig.attrMap.get("OMS_PULL_ORDER").get("pullDeliveryTimeSize"));
+        SimpleDateFormat dayformat =  new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        // Oms所有发货单
+        List<OmsDelivery> omsDeliveryslist = new ArrayList<OmsDelivery>(10000);
+        List<String> exclusionList = new ArrayList<String>(1000);
+        String logDate = date;
+        OmsRequestInfo omsRequestInfo;
+        OmsDeliveryInfo deliveryInfo;
+        //OMS发货单总条目数
+        Integer count = 0;
+        Long pageSize = OmsUtil.defPageSize;
+        try {
+            //发货单接口method
+            String method;
+            //订单接口method
+            Date date1 = DateUtil.addDay(DateUtil.getCurrentDate(), -6);
+
+            logDate = DateUtil.YYYYMMDD_FORMAT_SDF.format(dayformat.parse(date));
+            String s = DateUtil.convertDate2String(date1, DateUtil.DEFAULT_TIMESTAMP_FORMAT);
+            //如果当前传入时间小于当前时间-7天
+            if (DateUtil.compareTwoDateEqualByFormat(date, s, DateUtil.DEFAULT_TIMESTAMP_FORMAT) == 1 || DateUtil.compareTwoDateEqualByFormat(date, s, DateUtil.DEFAULT_TIMESTAMP_FORMAT) == 0) {
+                method = OmsUtil.tradeDeliverys;
+                // orderMethod = OmsUtil.tradeOrders;
+            } else if (DateUtil.compareTwoDateEqualByFormat(DateUtil.convertDate2String(DateUtil.addDay(DateUtil.getCurrentDate(), -7), DateUtil.DEFAULT_TIMESTAMP_FORMAT), date, DateUtil.DEFAULT_TIMESTAMP_FORMAT) == 0) {
+                method = "";
+                map.put("method", "当前天数为第七天不调用任何接口,method：" + method);
+                FileLogsUtil.info(log, "distributeOmsOrder  method:" + method);
+            } else {
+                method = OmsUtil.tradeHistory;
+            }
+
+            //1.获取date对应的系统时间
+            Date d = DateUtil.convertString2Date(date, DateUtil.DEFAULT_TIMESTAMP_FORMAT);
+            String omsDate = DateUtil.convertDate2String(d);
+            //当前结束时间
+            String endDate = omsDate.substring(0, 10) + " 23:59:59";
+            //当前页数
+            Date end = DateUtil.addSecond(DateUtil.addMinute(DateUtil.TIMESTAMP_FORMAT_SDF.parse(date),timeSize),-1);
+            Date begin = DateUtil.TIMESTAMP_FORMAT_SDF.parse(date);
+
+            // 如双十一，前五分钟三万多单，故而需要，每五分钟分开拉取当天的订单。
+            while (dayformat.parse(endDate).after(begin)) {
+
+                if(end.after(dayformat.parse(endDate))){
+                    end = dayformat.parse(endDate);
+                }
+                // 查询总记录数
+                omsRequestInfo = new OmsRequestInfo(1L, 1L, dayformat.format(begin), dayformat.format(end), method);
+                deliveryInfo = OmsUtil.omsDelivery(omsRequestInfo);
+
+                // 分批查出所有记录
+                count += deliveryInfo.getTotal();
+                long cycleIndex = Long.parseLong(deliveryInfo.getTotal() + "") / pageSize;
+                for (int i = 0; i <= cycleIndex; i++) {
+                    omsRequestInfo = new OmsRequestInfo((long) (i + 1), pageSize, dayformat.format(begin), dayformat.format(end), method);
+                    // 调用接口分页查询所有记录
+                    deliveryInfo = OmsUtil.omsDelivery(omsRequestInfo);
+                    if (deliveryInfo.getSuccess()) {
+                        omsDeliveryslist.addAll(deliveryInfo.getDeliverys());
+                    } else {
+                        // 判定失败，明天继续拉取这一次的订单。
+                        FileLogsUtil.error(log, "-------定时获取OMS订单明细（第" + (i + 1) + "页）失败date[" + logDate + "]-------");
+                    }
+                }
+
+                begin = DateUtil.addMinute(begin, timeSize);
+                end = DateUtil.addMinute(end, timeSize);
+            }
+
+            if (omsDeliveryslist.size() > 0) {
+                //3.遍历发货单
+                for (OmsDelivery delivery : omsDeliveryslist) {
+                    try {
+                        if(shopExclusionList.contains(delivery.getShopCode())) {
+                            exclusionList.add(delivery.getCode());
+                        }else {
+                            saveOmsDeliveryInfo(delivery);
+                        }
+                    } catch (Exception e) {
+                        list.add(delivery.getCode());
+                        //记录发货单号
+                        map.put("code", StringUtils.join(list, ","));
+                        map.put("message", e.getMessage());
+                        //记录日志
+                        FileLogsUtil.error(log, "distributeOmsOrderv error"
+                                + "发货时间为：" + date + "失败单据为：" + "[" + map.get("code") + "]" + "失败原因：" + "[" + map.get("message") + "]");
+                    }
+                    FileLogsUtil.info(log, "对接失败记录为" + JSONObject.fromObject(map));
+                }
+
+                //分销保存OMS发货单数目
+                Integer fxCount;
+                //分销获取的发货单数目
+                int omsCount;
+                //获取OMS发货单企业微信通知权限
+                String permissions = SysConfig.attrMap.get("OMS_TASK_PERMISSIONS").get("PEOPLE_PERMISSIONS");
+                //记录接口调用失败日期
+                String time = map.get("time");
+                //归档
+                String omsMethod = map.get("method");
+                if (StringUtils.isNotBlank(time)) {
+                    //记录接口异常日志
+                    omsService.saveLogTaskDate(logDate, CacheConstant.OMS_ORDER_LOG_STATUS_0, "接口数据异常", count, CacheConstant.OMS_ORDER_LOG_TYPE_ORDER);
+                } else if (StringUtils.isNotBlank(omsMethod)) {
+                    //记录归档时间日志
+                    omsService.saveLogTaskDate(logDate, CacheConstant.OMS_ORDER_LOG_STATUS_0, "前天数为第七天不调用任何接口 ", count, CacheConstant.OMS_ORDER_LOG_TYPE_ORDER);
+                } else {
+                    FileLogsUtil.info(log, "enterpriseWeChat" + JSONObject.fromObject(map));
+                }
+                //通过类型查出分销创建数
+                fxCount = omsDeliverRepository.getOmsCount(logDate);
+                //oms总数 = 保存的发货单数 + 排除的发货单数量
+                omsCount = fxCount + exclusionList.size();
+
+                if (count == omsCount) {
+                    String successRemark = "OMS存在" + count + "张发货单，本次同步成功" + fxCount + "张发货单，排除了"+ exclusionList.size() +"张，同步结果：成功！";
+                    omsService.saveLogTaskDate(logDate, CacheConstant.OMS_ORDER_LOG_STATUS_1, successRemark, count, CacheConstant.OMS_ORDER_LOG_TYPE_ORDER);
+                    OmsUtil.enterpriseWeChat(logDate, count, fxCount, permissions, successRemark);
+                } else {
+                    String failedRemark = "OMS存在" + count + "张发货单，本次同步" + fxCount + "张发货单，同步结果：失败!" + map.get("code");
+                    //记录失败日志并发送企业为微信
+                    omsService.saveLogTaskDate(logDate, CacheConstant.OMS_ORDER_LOG_STATUS_0, failedRemark, count, CacheConstant.OMS_ORDER_LOG_TYPE_ORDER);
+                    OmsUtil.enterpriseWeChat(logDate, count, fxCount, permissions, failedRemark);
+                }
+                FileLogsUtil.info(log,"distributeOmsOrder end",logDate + " OMS存在" + count + "张发货单，本次同步成功"
+                        + fxCount + "张发货单，排除了"+ exclusionList.size() +"张，被排除的发货单有：" + exclusionList);
+            } else {
+                throw new ServiceException("发货单数量为零，查询OMS发货数据异常");
+            }
+
+        } catch (Exception e) {
+            map.put("time", logDate);
+            String failedRemark = "OMS存在" + count + "张发货单，本次同步异常，同步结果：失败!";
+            //记录失败日志并发送企业为微信
+            omsService.saveLogTaskDate(logDate, CacheConstant.OMS_ORDER_LOG_STATUS_0, failedRemark, count, CacheConstant.OMS_ORDER_LOG_TYPE_ORDER);
+            FileLogsUtil.error(log, "OmsDelivery error" + e);
+        }
+
+    }
+
+    /**
+     * /**
+     * /**
+     * 发货单明细查询
+     */
+    @Override
+    public Page getPageOmsOrderInfoByCondition(Map<String, Object> params, Page page) throws ServiceException {
+        try {
+            //虚拟产品价格集合
+            List<Map<String, Object>> omsProductView = productRepository.getOmsProductView("2");
+            Map<String, Object> codePriceMap = new HashMap<String, Object>(16);
+            for (Map<String, Object> productView : omsProductView) {
+                codePriceMap.put((String) productView.get("UF_CODE"),productView.get("TOTAL_PRICE"));
+            }
+
+            Map<String, Object> productParams = new HashMap<String, Object>(4);
+            productParams.put("orderOrgin","24");
+            productParams.put("Status","1");
+            //虚拟组合商品集合
+            HashMap<String, String> codeNameMap = new HashMap<String, String>(16);
+            List<EbProductRelated> packProductList = packProductMapRepository.getPackProductList(productParams);
+            for (EbProductRelated ebProductRelated : packProductList) {
+                codeNameMap.put(ebProductRelated.getEbProductCode(), ebProductRelated.getEbProductName());
+            }
+            page.setRecordCount(omsDeliverRepository.getPageOmsOrderInfoListCount(params));
+            if (page.getRecordCount() > 0) {
+                List<Map<String, Object>> list = omsDeliverRepository.getPageOmsOrderInfoListByCondition(params, page.getFirstResult(), page.getRows(), page.getOrderBy());
+                Map<String, String> omsProductType = SysConfig.attrMap.get("OMS_PRODUCT_TYPE");
+                for (Map<String, Object> map : list) {
+                    if("2".equals(ParamUtil.toStr(map.get("PRODUCT_TYPE")))) {
+                        map.put("PRODUCT_NAME", codeNameMap.get(ParamUtil.toStr(map.get("PRODUCT_UFCODE"))));
+                        map.put("RETAIL_PRICE", codePriceMap.get(ParamUtil.toStr(map.get("PRODUCT_UFCODE"))));
+                    }else if("3".equals(ParamUtil.toStr(map.get("PRODUCT_TYPE")))){
+                        map.put("PRODUCT_SHARING",new BigDecimal(0));
+                    }
+                    if(map.get("PRODUCT_TYPE") != null){
+                        map.put("PRODUCT_TYPE",omsProductType.get(ParamUtil.toStr(map.get("PRODUCT_TYPE"))));
+                    }
+                }
+                page.setList(list);
+            }
+            return page;
+        } catch (RepositoryException re) {
+            FileLogsUtil.error(log, re.getMessage());
+            throw new ServiceException("数据库异常");
+        } catch (Exception e) {
+            FileLogsUtil.error(log, e.getMessage());
+            throw new ServiceException(e.getMessage());
+        }
+    }
+
+
+    @Override
+    public List<Map<String, String>> getOmsOrderInfoFailTime() throws ServiceException {
+        List<Map<String, String>> omsOrderFindDate;
+        try {
+            omsOrderFindDate = omsDeliverRepository.getOmsOrderFindDate();
+        } catch (Exception e) {
+            FileLogsUtil.error(log, e.getMessage());
+            throw new ServiceException(e.getMessage());
+        }
+        return omsOrderFindDate;
+    }
+
+
+    /**
+     * 保存OMS发货但信息数据
+     *
+     * @param delivery 发货单数据
+     */
+    @Transactional(propagation = Propagation.REQUIRED, rollbackFor = Exception.class)
+    public void saveOmsDeliveryInfo(OmsDelivery delivery) throws ServiceException {
+        List<EbOrderDetailInfo> orderDetailList = new ArrayList<EbOrderDetailInfo>();
+        try {
+            if (delivery != null) {
+                omsOrderService.createOrderDeliveryInfo(delivery);
+            } else {
+                FileLogsUtil.info(log, "发货单接口返回异常" + delivery.getCode());
+            }
+        } catch (ServiceException e1) {
+            FileLogsUtil.error(log, "获取OMS发货单失败！" + e1.getMessage());
+            throw new ServiceException(e1.getMessage());
+        }
+
+
+    }
+
+
+    /**
+     * 校验并保存OMS订单信息数据
+     *
+     * @param code 外部平台单号
+     */
+    private SaleOrder checkOmsOrder(String code, OmsRequestInfo omsRequestInfo) throws ServiceException {
+        SaleOrder saleOrder = null;
+        ArrayList<SaleOrderDetail> orderDetailList = new ArrayList<SaleOrderDetail>(10);
+        try {
+            FileLogsUtil.info(log, "订单编号为" + code);
+            OmsOrderInfo omsOrderInfo = OmsUtil.omsOrder(omsRequestInfo, code);
+            FileLogsUtil.info(log, "omsOrderInfo =" + omsOrderInfo);
+            if (omsOrderInfo.getSuccess() == true && omsOrderInfo.getOrders().size() > 0) {
+                List<OmsOrder> orders = omsOrderInfo.getOrders();
+                if (orders.size() > 0) {
+                    for (OmsOrder omsOrder : orders) {
+                        String platformId = ebOrderRepository.getPlatformId(omsOrder.getShopCode());
+                        saleOrder = new SaleOrder();
+                        saleOrder.setOrderId(omsOrder.getCode());
+                        saleOrder.setEbOrderId(omsOrder.getPlatformCode());
+                        saleOrder.setStatus(CacheConstant.EB_ORDER_STATUS_COMPLETE);
+                        saleOrder.setOrginPlatform(platformId);
+                        saleOrder.setMemo(omsOrder.getSellerMemo());
+                        saleOrder.setRemark(omsOrder.getBuyerMemo());
+                        saleOrder.setDeliveryMode("1");
+                        saleOrder.setDiscount(omsOrder.getDiscountFee());
+                        saleOrder.setShopId(omsOrder.getShopCode());
+                        saleOrder.setShopName(omsOrder.getShopName());
+                        saleOrder.setOrderTime(DateUtil.convertDate2String(omsOrder.getCreatetime(), DateUtil.DEFAULT_TIMESTAMP_FORMAT));
+                        saleOrder.setPayMoney(omsOrder.getPayment());
+                        String receiverArea = omsOrder.getReceiverArea();
+                        String[] split = receiverArea.split("-");
+                        if (split.length == 3) {
+                            saleOrder.setProvince(split[0]);
+                            saleOrder.setCity(split[1]);
+                            saleOrder.setDistrict(split[2]);
+                        }
+
+                        saleOrder.setTotalNum(omsOrder.getQty());
+                        saleOrder.setOrderMoney(omsOrder.getAmount());
+                        saleOrder.setReceiptName(omsOrder.getReceiverName());
+                        saleOrder.setReceiptAddr(omsOrder.getReceiverAddress());
+                        saleOrder.setReceiptPhone(omsOrder.getReceiverPhone());
+                        saleOrder.setReceiptMobile(omsOrder.getReceiverMobile());
+                        //支付时间
+                        saleOrder.setPayTime(DateUtil.convertDate2String(omsOrder.getPaytime(), DateUtil.DEFAULT_TIMESTAMP_FORMAT));
+                        //获取OMS订单明细
+                        List<Details> delivery = omsOrder.getDetails();
+                        for (int i = 0; i < delivery.size(); i++) {
+                            Details od = delivery.get(i);
+                            if (delivery.size() > 0) {
+                                SaleOrderDetail odInfo = new SaleOrderDetail();
+                                odInfo.setEbOrderId(omsOrder.getPlatformCode());
+                                odInfo.setUfCode(od.getItemCode());
+                                odInfo.setProductName(od.getItemName());
+                                odInfo.setProductNum(od.getQty());
+                                odInfo.setProductPrice(ParamUtil.toBigDecimal(od.getAmountAfter()));
+                                odInfo.setEbOrderId(omsOrder.getPlatformCode());
+                                //查询DL_PRODUCT 通过ufcode查到product.id
+                                odInfo.setProductId(ParamUtil.toInt(omsDeliverRepository.getProductId(od.getItemCode())));
+                                odInfo.setRemark(od.getNote());
+                                odInfo.setEbProductName(od.getPlatformItemName());
+                                odInfo.setAdjustMoney(ParamUtil.toBigDecimal(od.getPostFee()));
+                                odInfo.setStatus(CacheConstant.EB_ORDER_STATUS_UNCHCECK);
+                                odInfo.setCreateTime(omsOrder.getCreatetime());
+                                odInfo.setDiscount(ParamUtil.toBigDecimal(od.getDiscountFee()));
+                                odInfo.setPayStatus(2);
+                                orderDetailList.add(odInfo);
+                                saleOrder.setOrderDealerLst(orderDetailList);
+                            }
+
+                        }
+
+
+                    }
+
+                } else {
+                    FileLogsUtil.info(log, "获取订单明细失败！");
+                }
+                //记录日志
+            } else {
+                throw new ServiceException("获取订单信息异常！" + code + omsOrderInfo.getErrorDesc());
+            }
+
+            FileLogsUtil.info(log, "saleOrder ==" + saleOrder);
+
+        } catch (RepositoryException e) {
+            FileLogsUtil.error(log, e);
+        }
+
+
+        //1.校验订单是否已经存在于分销平台
+
+        //2.如果不存在订单,获取OMS订单信息
+
+        //3.各种校验，例如分摊金额
+
+        //4.封装好OmsOrder对象，返回
+        return saleOrder;
+    }
+
+
+    /**
+     * 下载OMS订单
+      * @param date 拉取日期
+     * @param productIdMap 产品UF_CODE 和 ID
+     * @param productPriceMap 产品UF_code 和 价格
+     * @param overSeaOmsShopIDList 跨境店铺ID
+     * @param ordinaryShopList 一般贸易的店铺ID
+     * @param packProductMapList 组合商品价格比率集合
+     */
+    @Override
+    public void pullOmsTrades(String date, Map<String, Integer> productIdMap, Map<String, BigDecimal> productPriceMap, List<String> overSeaOmsShopIDList, List<String> ordinaryShopList, Map<String, List<Map<String, Object>>> packProductMapList) {
+        //获取OMS退货单企业微信通知权限
+        String permissions = SysConfig.attrMap.get("OMS_TASK_PERMISSIONS").get("PEOPLE_PERMISSIONS");
+        String tradeMethod;  //拉单接口
+        // 每次拉取多长时间内的单，单位：分钟
+        int timeSize = ParamUtil.toInt(SysConfig.attrMap.get("OMS_PULL_ORDER").get("pullOrderTimeSize"));
+        long pageSize = ParamUtil.toLong(SysConfig.attrMap.get("OMS_PULL_ORDER").get("pullOrderPageSize")); //拉单每页大小
+        boolean pullTrades  = true; //拉单是否成功
+        String remark = "";
+        //保存成功的订单数
+        int succeedTotal = 0;
+        //失败单号list
+        List<String> failureCodeList = new ArrayList<String>(10);
+        SimpleDateFormat dayFormat =  new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        String logDate = date;
+        // 获取前七天时间
+        Date dateBefore7 = DateUtil.addDay(DateUtil.getCurrentDate(), -7);
+        OmsRequestInfo requestInfo;
+        List<OmsOrder> omsOrdersList = new ArrayList<OmsOrder>(10000);  // Oms所有订单
+        int orderTotal = -1;
+        try {
+            // 如果需要拉取的时间于最近七天内，调用订单查询,否则调用历史订单查询
+            if (dayFormat.parse(date).after(dateBefore7)) {
+                tradeMethod = OmsUtil.tradeGet;
+            } else {
+                tradeMethod = OmsUtil.tradeHistoryGet;
+            }
+            logDate = DateUtil.YYYYMMDD_FORMAT_SDF.format(dayFormat.parse(date));
+            String endDate = dayFormat.format(DateUtil.addDay(dayFormat.parse(date), 1));
+            Date end = DateUtil.addMinute(dayFormat.parse(date),timeSize);
+            Date begin = dayFormat.parse(date);
+
+            // 如双十一，前五分钟三万多单，故而需要，每五分钟分开拉取当天的订单。
+            while (dayFormat.parse(endDate).after(begin)) {
+
+                if(end.after(dayFormat.parse(endDate))){
+                    end = dayFormat.parse(endDate);
+                }
+                // 查询总记录数
+                requestInfo = new OmsRequestInfo(1L, 1L, dayFormat.format(begin), dayFormat.format(end), tradeMethod);
+                OmsOrderInfo omsOrderInfo = OmsUtil.omsOrder(requestInfo, "");
+
+                // 分批查出所有记录
+                orderTotal = omsOrderInfo.getTotal();
+                long cycleIndex = Long.parseLong(orderTotal + "") / pageSize;
+                for (int i = 0; i <= cycleIndex; i++) {
+                    try {
+                        requestInfo = new OmsRequestInfo((long) (i + 1), pageSize, dayFormat.format(begin), dayFormat.format(end), tradeMethod);
+                        // 调用接口分页查询所有记录
+                        omsOrderInfo = OmsUtil.omsOrder(requestInfo, "");
+
+                        if (omsOrderInfo.getSuccess()) {
+                            omsOrdersList.addAll(omsOrderInfo.getOrders());
+                        } else {
+                            // 判定失败，明天继续拉取这一次的订单。
+                            pullTrades = false;
+                            remark += "定时获取OMS接口订单明细（第" + (i + 1) + "页）失败,";
+                            FileLogsUtil.error(log, "-------定时获取OMS订单明细（第" + (i + 1) + "页）失败date[" + date + "]-------");
+                        }
+                    } catch (Exception e) {
+                        pullTrades = false;
+                        remark += "定时获取OMS接口订单明细（第" + (i + 1) + "页）失败,";
+                        FileLogsUtil.error(log, "-------定时获取OMS订单明细（第" + (i + 1) + "页）失败date[" + date + "]-------", e);
+                    }
+                }
+                begin = DateUtil.addMinute(begin, timeSize);
+                end = DateUtil.addMinute(end, timeSize);
+            }
+            Boolean insert;
+            // 日期当天所有订单查询结束，对数据进行保存
+            for (OmsOrder omsOrder : omsOrdersList) {
+                insert = true;
+                try {
+                    if (overSeaOmsShopIDList.contains(omsOrder.getShopCode())) {  // 判断是一般订单还是跨境订单
+//                        insert = omsOrderService.saveOmsOverseaOrder(omsOrder, productIdMap, productPriceMap);  // 保存跨境订单 已经写好的
+                        insert = true;
+                    } else if(ordinaryShopList.contains(omsOrder.getShopCode())) {
+                        insert = omsOrderService.saveOmsOrder(omsOrder, packProductMapList); // 保存普通电商订单
+                    }
+                }catch (Exception e){
+                    FileLogsUtil.info(log, "同步OMS跨境订单失败：" + omsOrder.toString());
+                    FileLogsUtil.error(log, e);
+                }
+                // 判断是否保存成功
+                if(!insert){
+                    failureCodeList.add(omsOrder.getPlatformCode());
+                }
+            }
+
+            orderTotal = omsOrdersList.size();
+            succeedTotal = omsOrdersList.size() - failureCodeList.size();
+            // 判断成功失败并且记录数据库日志
+            if (failureCodeList.size() == 0 && pullTrades) {
+                remark = "OMS存在" + orderTotal + "张订单，本次同步成功" + succeedTotal + "张订单，同步结果成功";
+                omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_0, remark, orderTotal, CacheConstant.OMS_ORDER_LOG_STATUS_1);
+            } else {
+                remark = "OMS存在" + orderTotal + "张订单，本次同步成功" + succeedTotal + "张订单，失败"+ failureCodeList.size()+"张，同步结果失败：" + failureCodeList.toString();
+                omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_0, remark, orderTotal, CacheConstant.OMS_ORDER_LOG_STATUS_0);
+            }
+            FileLogsUtil.info(log,"同步"+logDate+"OMS订单,"+remark);
+            OmsUtil.enterpriseWeChat(logDate, succeedTotal, orderTotal, permissions, remark);
+
+        } catch (Exception e) {
+            remark += "pullOmsTrades拉取订单异常";
+            omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_0, remark, orderTotal, CacheConstant.OMS_ORDER_LOG_STATUS_0);
+            OmsUtil.enterpriseWeChat(logDate, succeedTotal, orderTotal, permissions, remark);
+            FileLogsUtil.error(log, "OmsTradeJob.pullOmsTrades error" + remark , e);
+        }
+    }
+
+
+    /**
+     * 下载OMS退款单
+     * @param date 拉取日期
+     */
+    @Override
+    public void pullOmsRefundOrders(String date) {
+        //获取OMS退货单企业微信通知权限
+//        String permissions = SysConfig.attrMap.get("OMS_TASK_PERMISSIONS").get("PEOPLE_PERMISSIONS");
+        String method = OmsUtil.tradeRefundGet;  //拉单接口
+        long pageSize = ParamUtil.toLong(SysConfig.attrMap.get("OMS_PULL_ORDER").get("pullRefundOrderPageSize")); //拉单每页大小
+        boolean pullRefunds  = true; //拉单是否成功
+        String remark = "";
+        //保存成功的退款单数
+        int succeedTotal;
+        //失败单号list
+        List<String> failureCodeList = new ArrayList<String>(10);
+        SimpleDateFormat dayFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        String logDate = "";
+        // 获取前七天时间
+        OmsRequestInfo requestInfo;
+        List<TradeRefund> omsRefundOrdersList = new ArrayList<TradeRefund>(2000);  // Oms所有退款单
+        Integer refundsTotal = -1;
+        try {
+            logDate = DateUtil.YYYYMMDD_FORMAT_SDF.format(dayFormat.parse(date));
+            // 查询总记录数
+            String startDate = date;
+            String endDate = dayFormat.format(DateUtil.addDay(dayFormat.parse(date), 1));
+            requestInfo = new OmsRequestInfo(1L, 1L, startDate, endDate, method);
+            OmsRefundInfo omsRefundInfo = OmsUtil.omsRefundOrder(requestInfo, "");
+
+            // 分批查出所有记录
+            refundsTotal = omsRefundInfo.getTotal();
+            long cycleIndex = Long.parseLong(refundsTotal + "") / pageSize;
+            for (int i = 0; i <= cycleIndex; i++) {
+                try {
+                    requestInfo = new OmsRequestInfo((long) (i + 1), pageSize, startDate, endDate, method);
+                    // 调用接口分页查询所有记录
+                    omsRefundInfo = OmsUtil.omsRefundOrder(requestInfo, "");
+
+                    if (omsRefundInfo.getSuccess()) {
+                        omsRefundOrdersList.addAll(omsRefundInfo.getTradeRefunds());
+                    } else {
+                        // 判定失败，明天继续拉取这一次的退款单。
+                        pullRefunds = false;
+                        remark += "定时获取OMS接口退款单明细（第" + (i + 1) + "页）失败,";
+                        FileLogsUtil.error(log, "-------定时获取OMS退款单明细（第" + (i + 1) + "页）失败date[" + date + "]-------");
+                    }
+                } catch (Exception e) {
+                    pullRefunds = false;
+                    remark += "定时获取OMS接口退款单明细（第" + (i + 1) + "页）失败,";
+                    FileLogsUtil.error(log, "-------定时获取OMS退款单明细（第" + (i + 1) + "页）失败date[" + date + "]-------", e);
+                }
+            }
+
+            Boolean insert;
+            // 日期当天所有退款单查询结束，对数据进行保存
+            for (TradeRefund refundOrder : omsRefundOrdersList) {
+                insert = false;
+                try {
+                    insert = omsOrderService.saveOmsRefundOrder(refundOrder);  // 保存跨境订单
+                }catch (Exception e){
+                    FileLogsUtil.info(log, "同步OMS退款单失败：" + refundOrder.toString());
+                    FileLogsUtil.error(log, e);
+                }
+                // 判断是否保存成功
+                if(!insert){
+                    failureCodeList.add(refundOrder.getPlatfromCode());
+                }
+            }
+
+            succeedTotal = omsRefundOrdersList.size() - failureCodeList.size();
+            // 判断成功失败并且记录数据库日志
+            if (failureCodeList.size() == 0 && pullRefunds) {
+                remark = "OMS存在" + refundsTotal + "张退款单，本次同步成功" + succeedTotal + "张退款单，同步结果成功";
+                omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_1, remark, refundsTotal, CacheConstant.OMS_ORDER_LOG_STATUS_1);
+            } else {
+                remark = "OMS存在" + refundsTotal + "张退款单，本次同步成功" + succeedTotal + "张退款单，失败"+ failureCodeList.size()+"张，同步结果失败：" + failureCodeList.toString();
+                omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_1, remark, refundsTotal, CacheConstant.OMS_ORDER_LOG_STATUS_0);
+            }
+            FileLogsUtil.info(log,"同步"+logDate+"OMS退款单,"+remark);
+//            OmsUtil.enterpriseWeChat(date, succeedTotal, refundsTotal, permissions, remark);
+
+
+        } catch (Exception e) {
+            remark += "pullOmsRefundOrder拉取退款单异常";
+            omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_1, remark, refundsTotal, CacheConstant.OMS_ORDER_LOG_STATUS_0);
+//            OmsUtil.enterpriseWeChat(date, succeedTotal, refundsTotal, permissions, remark);
+            FileLogsUtil.error(log, "OmsRefundOrderJob.pullOmsRefundOrder error" + remark , e);
+        }
+    }
+
+    @Override
+    public void updateOmsOrderState(String date, Map<String, String> shopListMap) {
+        String remark = "";
+        //失败单号list
+        List<String> failureCodeList = new ArrayList<String>(16);
+        List<String> ordinaryShopList = new ArrayList<String>(16);
+        List<String> platFromIdList = new ArrayList<String>(16);
+        String logDate = date;
+        SimpleDateFormat dayFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        try {
+            logDate = DateUtil.YYYYMMDD_FORMAT_SDF.format(dayFormat.parse(date));
+            for (String key : shopListMap.keySet()) {
+                platFromIdList.add(key);
+                ordinaryShopList.add(shopListMap.get(key));
+            }
+            //准备数据
+            Date beginDate = DateUtil.YYYYMMDD_FORMAT_SDF.parse(date);
+            Date endDate = DateUtil.addDay(beginDate, 1);
+
+            // 查询所有该日创建的发货单。
+            List<Map<String, Object>> delivers = omsOrderService.getDeliverByCreateDate(beginDate, endDate);
+
+            // 查询所有该日创建的退款单。
+            List<EbRefundInfo> refunds = omsOrderService.getRefundInfoByCreateDate(beginDate, endDate);
+
+            //根据退款单更新状态
+            for (EbRefundInfo refund : refunds) {
+                if(ordinaryShopList.contains(refund.getShopCode())) {
+                    omsOrderService.updateStateByRefund(refund, failureCodeList);
+                }
+            }
+            //根据发货单更新状态
+            for (Map<String, Object> deliver : delivers) {
+                if(platFromIdList.contains(ParamUtil.toStr(deliver.get("PLATFORM_ID")))) {
+                    omsOrderService.updateStateByDeliver(deliver, failureCodeList);
+                }
+            }
+
+            if(failureCodeList.size() > 0){
+                remark = "更新订单状态失败"+ failureCodeList.size()+"张，同步结果失败：" + failureCodeList.toString();
+                FileLogsUtil.info(log, "updateOmsOrderState error" + remark);
+                omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_4, remark, 0, CacheConstant.OMS_ORDER_LOG_STATUS_0);
+            }else {
+                remark = "更新订单状态同步结果成功";
+                FileLogsUtil.info(log, "updateOmsOrderState success" + remark);
+                omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_4, remark, 0, CacheConstant.OMS_ORDER_LOG_STATUS_1);
+            }
+        }catch (Exception e){
+            remark += "updateOmsOrderState更新"+logDate+"订单状态异常";
+            omsService.saveOrderTaskLogDate(logDate, CacheConstant.OMS_LOG_ORDER_TYPE_4, remark, 0, CacheConstant.OMS_ORDER_LOG_STATUS_0);
+//            OmsUtil.enterpriseWeChat(date, succeedTotal, refundsTotal, permissions, remark);
+            FileLogsUtil.error(log, "updateOmsOrderState error" + remark , e);
+        }
+
+    }
+
+}
+
+
